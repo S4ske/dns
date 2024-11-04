@@ -80,15 +80,17 @@ def parse_dns_answers(response: bytes) -> tuple[list[str], float]:
     answer_count = int.from_bytes(response[6:8])
     offset = 12 + len(response[12:].split(b"\x00", 1)[0]) + 5
     answers = []
-    ttl = 0
+    ttl = 0xffffffff
 
     for _ in range(answer_count):
-        if response[offset + 2: offset + 4] == b"\x00\x01" and response[offset + 4: offset + 6] == b"\x00\x01":
-            ttl = min(ttl, int.from_bytes(response[offset + 6: offset + 10]))
-            rd_length = int.from_bytes(response[offset + 10: offset + 12])
-            ip = ".".join(map(str, response[offset + 12: offset + 12 + rd_length]))
+        to_skip = get_length_to_skip(response, offset)
+        if (response[offset + to_skip: offset + to_skip + 2] == b"\x00\x01"
+                and response[offset + to_skip + 2: offset + to_skip + 4] == b"\x00\x01"):
+            ttl = min(ttl, int.from_bytes(response[offset + to_skip + 4: offset + to_skip + 8]))
+            rd_length = int.from_bytes(response[offset + to_skip + 8: offset + to_skip + 10])
+            ip = ".".join(map(str, response[offset + to_skip + 10: offset + to_skip + 10 + rd_length]))
             answers.append(ip)
-        offset += 12 + int.from_bytes(response[offset + 10: offset + 12])
+        offset += to_skip + 10 + int.from_bytes(response[offset + to_skip + 8: offset + to_skip + 10])
 
     return answers, ttl
 
@@ -120,7 +122,6 @@ def resolve_domain(domain_name: str) -> list[str] | None:
         else:
             next_servers = None
 
-    logger.warning(f"No response found for {domain_name}")
     return None
 
 
@@ -129,14 +130,18 @@ def parse_additional(response: bytes) -> list[str]:
     additional_count = int.from_bytes(response[10:12])
     offset = 12 + len(response[12:].split(b"\x00", 1)[0]) + 5
     for _ in range(authoritative_count):
-        offset += 12 + int.from_bytes(response[offset + 10: offset + 12])
+        to_skip = get_length_to_skip(response, offset)
+        offset += to_skip + 10 + int.from_bytes(response[offset + to_skip + 8: offset + to_skip + 10])
     records = []
 
     for _ in range(additional_count):
-        if response[offset + 2: offset + 4] == b"\x00\x01" and response[offset + 4: offset + 6] == b"\x00\x01":
-            ip = ".".join(map(str, response[offset + 12: offset + int.from_bytes(response[offset + 10: offset + 12])]))
+        to_skip = get_length_to_skip(response, offset)
+        if (response[offset + to_skip: offset + to_skip + 2] == b"\x00\x01"
+                and response[offset + to_skip + 2: offset + to_skip + 4] == b"\x00\x01"):
+            ip = ".".join(map(str, response[offset + to_skip + 10: offset + to_skip + 10
+                                                         + int.from_bytes(response[offset + 10: offset + 12])]))
             records.append(ip)
-        offset += 12 + int.from_bytes(response[offset + 10: offset + 12])
+        offset += to_skip + 10 + int.from_bytes(response[offset + 10: offset + 12])
 
     return records
 
@@ -144,52 +149,87 @@ def parse_additional(response: bytes) -> list[str]:
 def handle_client(
         server_socket: socket.socket, message: bytes, client_address: Any
 ) -> None:
-    domain_names = parse_dns_query_names(message)
-    logger.info(f"Received query for {domain_names} from {client_address}")
+    domain_name = parse_dns_query_name(message)
+    if not domain_name:
+        server_socket.sendto(build_error_response(message, 3), client_address)
+        return
+    logger.info(f"Received query for {domain_name} from {client_address}")
 
-    response_ips = {}
-    for domain_name in domain_names:
-        curr_ips = resolve_domain(domain_name)
-        if curr_ips:
-            response_ips[domain_name] = resolve_domain(domain_name)
-        else:
-            logger.warning(f"No response found for {domain_name}")
+    response_ips = resolve_domain(domain_name)
     if response_ips:
         response_message = build_response_message(message, response_ips)
         server_socket.sendto(response_message, client_address)
+    else:
+        server_socket.sendto(build_error_response(message, 3), client_address)
+        logger.warning(f"No response found for {domain_name}")
 
 
-def parse_dns_query_names(message: bytes) -> list[str]:
-    question_count = int.from_bytes(message[4: 6])
-    offset = 12
-    res = []
-    for _ in range(question_count):
-        domain_parts = []
-        while message[offset] != 0:
-            length = message[offset]
-            domain_parts.append(message[offset + 1: offset + 1 + length].decode())
-            offset += length + 1
-        res.append(".".join(domain_parts))
-        offset += 5  # Сервер поддерживает только записи типа A, поэтому не проверяет тип запроса и в любом случае
-        # вернёт запись типа A
+def get_length_to_skip(message: bytes, offset: int) -> int:
+    if (message[offset] & 0xc0) == 0xc0:
+        return 2
+    res = 1
+    while message[offset] != 0:
+        length = message[offset]
+        offset += length + 1
+        res += length + 1
     return res
 
 
-def build_response_message(query_message: bytes, response_ips: dict[str, list[str]]) -> bytes:
+def parse_dns_query_name(message: bytes) -> str | None:
+    offset = 12
+    domain_parts = []
+    while message[offset] != 0:
+        length = message[offset]
+        domain_parts.append(message[offset + 1: offset + 1 + length].decode())
+        offset += length + 1
+    if message[offset + 1: offset + 3] != b"\x00\x01":
+        return None
+    return ".".join(domain_parts)
+
+
+def build_response_message(query_message: bytes, response_ips: list[str]) -> bytes:
     response_id = query_message[:2]
-    header = response_id + b"\x81\x80"
-    header += b"\x00\x01"
-    header += len(response_ips).to_bytes(2, "big")
-    header += b"\x00\x00" + b"\x00\x00"
-    question = query_message[12:]
+    flags = b"\x81\x80"
+    qdcount = b"\x00\x01"
+    ancount = len(response_ips).to_bytes(2, byteorder='big')
+    nscount = b"\x00\x00"
+    arcount = b"\x00\x00"
+    header = response_id + flags + qdcount + ancount + nscount + arcount
+
+    offset = 12
+    while query_message[offset] != 0:
+        offset += query_message[offset] + 1
+    offset += 5
+    question = query_message[12:offset]
 
     answers = b""
     for ip in response_ips:
         answers += b"\xc0\x0c"
-        answers += b"\x00\x01" + b"\x00\x01" + b"\x00\x00\x00\x3c" + b"\x00\x04"
+        answers += b"\x00\x01"
+        answers += b"\x00\x01"
+        answers += b"\x00\x00\x01\x2c"
+        answers += b"\x00\x04"
         answers += bytes(map(int, ip.split(".")))
 
     return header + question + answers
+
+
+def build_error_response(query_message: bytes, error_code: int) -> bytes:
+    response_id = query_message[:2]
+    flags = int.to_bytes(0x8180 + error_code, 2)
+    qdcount = b"\x00\x01"
+    ancount = b"\x00\x00"
+    nscount = b"\x00\x00"
+    arcount = b"\x00\x00"
+    header = response_id + flags + qdcount + ancount + nscount + arcount
+
+    offset = 12
+    while query_message[offset] != 0:
+        offset += query_message[offset] + 1
+    offset += 5
+    question = query_message[12:offset]
+
+    return header + question
 
 
 def start_dns_server(host: str = "0.0.0.0", port: int = 5353) -> None:
